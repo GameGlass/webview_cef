@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -43,8 +44,14 @@ class WebViewController extends ValueNotifier<bool> {
   Widget get webviewWidget => _webviewWidget;
   Widget get loadingWidget => _loadingWidget ?? const Text("loading...");
 
-  late Completer<void> _creatingCompleter;
+  // Created eagerly so [ready] and anything chained off it are usable before
+  // [initialize] is called — registering channels up front needs that.
+  Completer<void> _creatingCompleter = Completer<void>();
   Future<void> get ready => _creatingCompleter.future;
+  bool _initializeStarted = false;
+  // [_browserId] is `late`; this says whether the platform side has handed one
+  // back yet, because reading it before that throws.
+  bool _browserCreated = false;
   bool _isDisposed = false;
   bool _focusEditable = false;
 
@@ -64,6 +71,26 @@ class WebViewController extends ValueNotifier<bool> {
               JavascriptMessage(message, callbackId, frameId));
         } else {
           debugPrint('Channel "$channelName" is not exists');
+          // The page may be awaiting a reply. Answer with an error rather than
+          // dropping it, or that await never settles and the caller hangs
+          // silently — the hardest kind of bridge bug to diagnose.
+          //
+          // The failure has to travel in the payload: sendJavaScriptChannelCallBack's
+          // |error| flag is not forwarded to the page (ExecuteJSCallbackFunc
+          // interpolates only the callback id and the result).
+          //
+          // Replied to unconditionally: the browser allocates a request id for
+          // every message, so callbackId cannot tell us whether the page passed
+          // a callback. A page that did not is charged one round trip whose
+          // reply ExecuteJSCallbackFunc then drops.
+          sendJavaScriptChannelCallBack(
+              true,
+              jsonEncode({
+                'ok': false,
+                'error': 'no such channel: $channelName',
+              }),
+              callbackId,
+              frameId);
         }
       };
 
@@ -78,16 +105,31 @@ class WebViewController extends ValueNotifier<bool> {
     if (_isDisposed) {
       return Future<void>.value();
     }
-    _creatingCompleter = Completer<void>();
+    // Only replace it on a re-initialize; the first one is created with the
+    // controller so callers can chain off [ready] before this point.
+    if (_creatingCompleter.isCompleted) {
+      _creatingCompleter = Completer<void>();
+    }
+    _initializeStarted = true;
     try {
       await WebviewManager().ready;
       List args = await _pluginChannel.invokeMethod('create', url);
       _browserId = args[0] as int;
       _textureId = args[1] as int;
+      _browserCreated = true;
       WebviewManager().onBrowserCreated(_index, _browserId);
       await Future.delayed(const Duration(milliseconds: 50));
       _webviewWidget = WebView(this);
       value = true;
+      // Channels registered before initialize() have had no browser to inject
+      // their globals into until now. Driven from here rather than chained off
+      // [_creatingCompleter]: a failed attempt replaces that completer, so a
+      // continuation captured earlier is dropped and the retry that succeeds
+      // would inject nothing.
+      if (_javascriptChannels.isNotEmpty) {
+        await _pluginChannel.invokeMethod('setJavaScriptChannels',
+            [_browserId, _javascriptChannels.keys.toList()]);
+      }
       _creatingCompleter.complete();
     } on PlatformException catch (e) {
       _creatingCompleter.completeError(e);
@@ -101,11 +143,27 @@ class WebViewController extends ValueNotifier<bool> {
 
   @override
   Future<void> dispose() async {
-    await _creatingCompleter.future;
+    // Waiting on the completer is only meaningful once initialize() has begun;
+    // it is created with the controller, so on a never-initialized (or
+    // failed-early) controller this would otherwise never settle.
+    if (_initializeStarted) {
+      try {
+        await _creatingCompleter.future;
+      } catch (_) {
+        // initialize() failed; there is still local state to tear down.
+      }
+    }
     if (!_isDisposed) {
       _isDisposed = true;
-      WebviewManager().removeWebView(_browserId);
-      await _pluginChannel.invokeMethod('close', _browserId);
+      if (_browserCreated) {
+        WebviewManager().removeWebView(_browserId);
+        await _pluginChannel.invokeMethod('close', _browserId);
+      } else {
+        // Never initialized, or initialize() failed before 'create' returned:
+        // there is no browser to close and _browserId is unset, so reading it
+        // here would throw. Drop the pending registration instead.
+        WebviewManager().removePendingWebView(_index);
+      }
     }
     super.dispose();
   }
@@ -195,15 +253,28 @@ class WebViewController extends ValueNotifier<bool> {
     ]);
   }
 
+  /// Registers [channels] to receive messages from page JavaScript.
+  ///
+  /// Safe to call before [initialize]. Registration is Dart-side routing, and
+  /// [initialize] is what starts the page loading — so requiring a live browser
+  /// here would mean a script on the page could send a message before its
+  /// handler exists, and that message would be dropped. Callers that register up
+  /// front are guaranteed not to miss one.
   Future<void> setJavaScriptChannels(Set<JavascriptChannel> channels) async {
     if (_isDisposed) {
       return;
     }
-    assert(value);
     _assertJavascriptChannelNamesAreUnique(channels);
 
     for (var channel in channels) {
       _javascriptChannels[channel.name] = channel;
+    }
+
+    // Injecting the channel-name globals needs a browser, and there is none
+    // yet. [initialize] injects every registered channel once it has one;
+    // nothing is lost meanwhile, because inbound routing is already live.
+    if (!value) {
+      return;
     }
 
     return _pluginChannel.invokeMethod('setJavaScriptChannels',
@@ -272,6 +343,22 @@ class WebViewController extends ValueNotifier<bool> {
     assert(value);
     return _pluginChannel.invokeMethod('cursorClickUp',
         [_browserId, position.dx.round(), position.dy.round()]);
+  }
+
+  /// Forwards a real touch contact to CEF.
+  ///
+  /// [type] is 0=down, 1=up, 2=move, 3=cancel; [id] is the Flutter pointer id,
+  /// which CEF uses to track concurrent contacts, so passing it through
+  /// unchanged is what gives multi-touch. Deliberately separate from the
+  /// cursor* methods so the page receives touch events rather than
+  /// synthesised mouse ones.
+  Future<void> sendTouchEvent(int type, int id, Offset position) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value);
+    return _pluginChannel.invokeMethod('sendTouchEvent',
+        [_browserId, type, id, position.dx.round(), position.dy.round()]);
   }
 
   /// Sets the horizontal and vertical scroll delta.
@@ -583,13 +670,30 @@ class WebViewState extends State<WebView> with WebeViewTextInput {
                 }
               });
             }
+            if (ev.kind == PointerDeviceKind.touch) {
+              _controller.sendTouchEvent(0, ev.pointer, ev.localPosition);
+              return;
+            }
             _controller._cursorClickDown(ev.localPosition);
           },
           onPointerUp: (ev) {
+            if (ev.kind == PointerDeviceKind.touch) {
+              _controller.sendTouchEvent(1, ev.pointer, ev.localPosition);
+              return;
+            }
             _controller._cursorClickUp(ev.localPosition);
           },
           onPointerMove: (ev) {
+            if (ev.kind == PointerDeviceKind.touch) {
+              _controller.sendTouchEvent(2, ev.pointer, ev.localPosition);
+              return;
+            }
             _controller._cursorDragging(ev.localPosition);
+          },
+          onPointerCancel: (ev) {
+            if (ev.kind == PointerDeviceKind.touch) {
+              _controller.sendTouchEvent(3, ev.pointer, ev.localPosition);
+            }
           },
           onPointerSignal: (signal) {
             if (signal is PointerScrollEvent) {

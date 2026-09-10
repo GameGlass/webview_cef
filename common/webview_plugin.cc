@@ -19,6 +19,11 @@ namespace webview_cef {
 	CefString userAgent;
 	CefString rootCachePath;
 	bool isCefInitialized = false;
+
+	// A platform default, a rootCachePath passed to the "init" call replaces it
+	void setRootCachePath(const std::string& path) {
+		rootCachePath = CefString(path);
+	}
 #ifdef OS_MAC
 	std::string g_macSubprocessPath;
 	std::string g_macFrameworkDirPath;
@@ -249,6 +254,58 @@ namespace webview_cef {
                 }
             };
 
+            m_handler->onLoadError = [=, this](int nBrowserId, int errorCode,
+                                               std::string errorText,
+                                               std::string failedUrl,
+                                               bool isMainFrame)
+            {
+                if (m_invokeFunc)
+                {
+                    WValue* bId = webview_value_new_int(nBrowserId);
+                    WValue* code = webview_value_new_int(errorCode);
+                    WValue* text = webview_value_new_string(const_cast<char*>(errorText.c_str()));
+                    WValue* url = webview_value_new_string(const_cast<char*>(failedUrl.c_str()));
+                    WValue* mainFrame = webview_value_new_bool(isMainFrame);
+                    WValue* retMap = webview_value_new_map();
+                    webview_value_set_string(retMap, "browserId", bId);
+                    webview_value_set_string(retMap, "errorCode", code);
+                    webview_value_set_string(retMap, "errorText", text);
+                    webview_value_set_string(retMap, "failedUrl", url);
+                    webview_value_set_string(retMap, "isMainFrame", mainFrame);
+                    m_invokeFunc("onLoadError", retMap);
+                    webview_value_unref(bId);
+                    webview_value_unref(code);
+                    webview_value_unref(text);
+                    webview_value_unref(url);
+                    webview_value_unref(mainFrame);
+                    webview_value_unref(retMap);
+                }
+            };
+
+            m_handler->onRenderProcessTerminated = [=, this](int nBrowserId, int status,
+                                                             int errorCode,
+                                                             std::string errorString)
+            {
+                if (m_invokeFunc)
+                {
+                    WValue* bId = webview_value_new_int(nBrowserId);
+                    WValue* st = webview_value_new_int(status);
+                    WValue* code = webview_value_new_int(errorCode);
+                    WValue* text = webview_value_new_string(const_cast<char*>(errorString.c_str()));
+                    WValue* retMap = webview_value_new_map();
+                    webview_value_set_string(retMap, "browserId", bId);
+                    webview_value_set_string(retMap, "status", st);
+                    webview_value_set_string(retMap, "errorCode", code);
+                    webview_value_set_string(retMap, "errorString", text);
+                    m_invokeFunc("onRenderProcessTerminated", retMap);
+                    webview_value_unref(bId);
+                    webview_value_unref(st);
+                    webview_value_unref(code);
+                    webview_value_unref(text);
+                    webview_value_unref(retMap);
+                }
+            };
+
 			m_init = true;
 		}
 	}
@@ -264,6 +321,8 @@ namespace webview_cef {
 		m_handler->onJavaScriptChannelMessage = nullptr;
 		m_handler->onFocusedNodeChangeMessage = nullptr;
 		m_handler->onImeCompositionRangeChangedMessage = nullptr;
+		m_handler->onLoadError = nullptr;
+		m_handler->onRenderProcessTerminated = nullptr;
 		m_init = false;
 	}
 
@@ -333,11 +392,20 @@ namespace webview_cef {
 			m_handler->changeSize(browserId, (float)dpi, (int)std::round(width), (int)std::round(height));
 			result(1, nullptr);
 		}
-		else if (name.compare("cursorClickDown") == 0 
-			|| name.compare("cursorClickUp") == 0 
-			|| name.compare("cursorMove") == 0 
+		else if (name.compare("cursorClickDown") == 0
+			|| name.compare("cursorClickUp") == 0
+			|| name.compare("cursorMove") == 0
 			|| name.compare("cursorDragging") == 0) {
 			result(cursorAction(values, name), nullptr);
+		}
+		else if (name.compare("sendTouchEvent") == 0) {
+			int browserId = int(webview_value_get_int(webview_value_get_list_value(values, 0)));
+			auto type = webview_value_get_int(webview_value_get_list_value(values, 1));
+			auto id = webview_value_get_int(webview_value_get_list_value(values, 2));
+			auto x = webview_value_get_int(webview_value_get_list_value(values, 3));
+			auto y = webview_value_get_int(webview_value_get_list_value(values, 4));
+			m_handler->sendTouchEvent(browserId, (int)type, (int)id, (int)x, (int)y);
+			result(1, nullptr);
 		}
 		else if (name.compare("setScrollDelta") == 0) {
 			int browserId = int(webview_value_get_int(webview_value_get_list_value(values, 0)));

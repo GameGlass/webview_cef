@@ -64,6 +64,10 @@ namespace webview_cef {
     int initCEFProcesses(CefMainArgs args);
     int initCEFProcesses();
     void startCEF();
+    // App-specific writable directory for CEF's caches and its process
+    // singleton. Must be called before startCEF(); if unset, CEF warns and
+    // shares a default path with every other CEF app on the machine.
+    void setRootCachePath(const std::string& path);
 #ifdef OS_MAC
     // macOS multi-process: the platform layer (Obj-C) resolves these from the
     // app bundle and sets them before startCEF() so CEF can launch the bundled
