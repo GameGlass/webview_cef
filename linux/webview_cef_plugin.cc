@@ -3,6 +3,7 @@
 #include <flutter_linux/flutter_linux.h>
 #include <gtk/gtk.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 
 #include <cstring>
 #include <unordered_map>
@@ -309,12 +310,27 @@ void webview_cef_plugin_register_with_registrar(FlPluginRegistrar *registrar)
 
   plugin->m_textureRegister = fl_plugin_registrar_get_texture_registrar(registrar);
 
-  // Give CEF an app-specific cache root before it is initialised (which happens
-  // on the Dart-side "init" call). Without it CEF warns and shares a default
-  // path with every other CEF app, so their process singletons collide.
+  // Give CEF a cache root before it is initialised (which happens on the
+  // Dart-side "init" call). Left unset, CEF warns and shares a default path
+  // with every other CEF application, so their process singletons collide.
+  //
+  // Keyed by PID, because Chromium's process singleton is keyed on this path:
+  // a second instance starting against a path another process already owns
+  // hands its launch off to that process instead of initialising, and the
+  // owner answers by opening a real browser window. An embedder that runs
+  // several instances at once therefore gets a stray browser window per extra
+  // instance. A per-process path keeps them independent — the same reason the
+  // Windows side keys its WebView2 user-data folder by PID.
+  //
+  // The cost is that nothing in here is reused across runs. That is already
+  // true in practice: CefSettings.cache_path is left unset, so browser storage
+  // is in-memory regardless, and this directory only holds the singleton lock
+  // and similar per-run bookkeeping.
   const char *app_name = g_get_prgname();
+  g_autofree gchar *pid_dir = g_strdup_printf("%d", (int)getpid());
   g_autofree gchar *cache_root = g_build_filename(
-      g_get_user_cache_dir(), app_name ? app_name : "webview_cef", "cef", nullptr);
+      g_get_user_cache_dir(), app_name ? app_name : "webview_cef", "cef",
+      pid_dir, nullptr);
   webview_cef::setRootCachePath(cache_root);
 
   g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
