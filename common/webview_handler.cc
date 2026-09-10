@@ -40,13 +40,6 @@ namespace {
 // The only browser that currently get focused
 CefRefPtr<CefBrowser> current_focused_browser_ = nullptr;
 
-// Returns a data: URI with the specified contents.
-std::string GetDataURI(const std::string& data, const std::string& mime_type) {
-    return "data:" + mime_type + ";base64," +
-    CefURIEncode(CefBase64Encode(data.data(), data.size()), false)
-        .ToString();
-}
-
 }  // namespace
 
 WebviewHandler::WebviewHandler() {
@@ -170,7 +163,7 @@ bool WebviewHandler::OnBeforePopup(CefRefPtr<CefBrowser> browser,
                                   int popup_id,
                                   const CefString& target_url,
                                   const CefString& target_frame_name,
-                                  WindowOpenDisposition target_disposition,
+                                  CefLifeSpanHandler::WindowOpenDisposition target_disposition,
                                   bool user_gesture,
                                   const CefPopupFeatures& popupFeatures,
                                   CefWindowInfo& windowInfo,
@@ -203,18 +196,61 @@ void WebviewHandler::OnLoadError(CefRefPtr<CefBrowser> browser,
                                 const CefString& failedUrl) {
     CEF_REQUIRE_UI_THREAD();
 
-    // Don't display an error for downloaded files.
+    // ERR_ABORTED is what any in-page navigation looks like from here (a
+    // window.location assignment, a redirect, a router push): the pending
+    // request is abandoned in favour of the new one. Reporting it as an error
+    // leads a host into reloading the original URL, which navigates again and
+    // aborts again — an endless reload loop.
     if (errorCode == ERR_ABORTED)
         return;
-    
-    // Display a load error message using a data: URI.
-    std::stringstream ss;
-    ss << "<html><body bgcolor=\"white\">"
-    "<h2>Failed to load URL "
-    << std::string(failedUrl) << " with error " << std::string(errorText)
-    << " (" << errorCode << ").</h2></body></html>";
-    
-    frame->LoadURL(GetDataURI(ss.str(), "text/html"));
+
+    // Report to the host rather than navigating to a data: URI error page.
+    // Overwriting the document destroys the JS bridge and any app state, and
+    // leaves the host with no way to distinguish "offline for a moment" from
+    // "genuinely broken" — the host is the only side that knows whether a
+    // retry is appropriate.
+    if (onLoadError) {
+        onLoadError(browser->GetIdentifier(), static_cast<int>(errorCode),
+                    errorText.ToString(), failedUrl.ToString(),
+                    frame && frame->IsMain());
+    }
+}
+
+void WebviewHandler::OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser,
+                                               TerminationStatus status,
+                                               int error_code,
+                                               const CefString& error_string) {
+    CEF_REQUIRE_UI_THREAD();
+
+    // The renderer is gone, so OnPaint will never fire again and the texture the
+    // host is showing is a frozen last frame. Only the host can recover (by
+    // reloading), so surface it rather than swallowing it.
+    if (onRenderProcessTerminated) {
+        onRenderProcessTerminated(browser->GetIdentifier(),
+                                  static_cast<int>(status), error_code,
+                                  error_string.ToString());
+    }
+}
+
+bool WebviewHandler::OnRequestMediaAccessPermission(CefRefPtr<CefBrowser> browser,
+                                                    CefRefPtr<CefFrame> frame,
+                                                    const CefString& requesting_origin,
+                                                    uint32_t requested_permissions,
+                                                    CefRefPtr<CefMediaAccessCallback> callback) {
+    CEF_REQUIRE_UI_THREAD();
+
+    // Deny. Nothing embedded here needs a local track, and an off-screen view
+    // has no UI to prompt with — so a grant would be silent, and would follow
+    // the page wherever it navigates or whatever it frames.
+    //
+    // |requested_permissions| is a bitmask that can carry
+    // CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE / _DESKTOP_VIDEO_CAPTURE as
+    // well as the device ones, so passing it back wholesale would hand any
+    // third-party origin screen capture, not just camera and microphone.
+    // Anything that does need capture should be granted here per origin and
+    // masked to the bits it asked for.
+    callback->Cancel();
+    return true;
 }
 
 void WebviewHandler::OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
@@ -367,6 +403,38 @@ void WebviewHandler::cursorClick(int browserId, int x, int y, bool up)
             it->second.browser->GetHost()->SendMouseClickEvent(ev, CefBrowserHost::MouseButtonType::MBT_LEFT, up, 1);
         }
     }
+}
+
+void WebviewHandler::sendTouchEvent(int browserId, int type, int id, int x, int y)
+{
+    auto it = browser_map_.find(browserId);
+    if (it == browser_map_.end()) {
+        return;
+    }
+
+    CefTouchEvent ev;
+    switch (type) {
+        case 0: ev.type = CEF_TET_PRESSED; break;
+        case 1: ev.type = CEF_TET_RELEASED; break;
+        case 2: ev.type = CEF_TET_MOVED; break;
+        case 3: ev.type = CEF_TET_CANCELLED; break;
+        default: return;
+    }
+    // CEF tracks concurrent contacts by id, so passing Flutter's pointer id
+    // through unchanged is what makes multi-touch work.
+    ev.id = id;
+    ev.x = static_cast<float>(x);
+    ev.y = static_cast<float>(y);
+    ev.radius_x = 0;
+    ev.radius_y = 0;
+    ev.rotation_angle = 0;
+    // Flutter's Linux embedder doesn't report pressure for touch, and 0 would
+    // read as "no contact", so report full pressure.
+    ev.pressure = 1.0f;
+    ev.modifiers = EVENTFLAG_NONE;
+    ev.pointer_type = CEF_POINTER_TYPE_TOUCH;
+
+    it->second.browser->GetHost()->SendTouchEvent(ev);
 }
 
 void WebviewHandler::cursorMove(int browserId, int x , int y, bool dragging)
@@ -680,15 +748,16 @@ void WebviewHandler::sendJavaScriptChannelCallBack(const bool error, const std::
     args->SetBool(1, error);
     args->SetString(2, result);
     auto bit = browser_map_.find(browserId);
-    if(bit != browser_map_.end()){
-        int64_t frameIdInt = atoll(frameId.c_str());
-
-        CefRefPtr<CefFrame> frame = bit->second.browser->GetMainFrame();
-
+    if(bit != browser_map_.end() && bit->second.browser.get()){
+        // Look the frame up by the identifier the call came in with. Comparing
+        // against GetMainFrame() only meant a call made from an iframe was
+        // never answered — the page's await stayed pending forever, and the
+        // callback it registered leaked on that frame's window.
+        //
         // CefFrame::GetIdentifier() returns a string identifier in current CEF
-        // (since CEF 122) on every platform.
-        bool identifierMatch = std::stoll(frame->GetIdentifier().ToString()) == frameIdInt;
-        if (identifierMatch)
+        // (since CEF 122) on every platform, which is what frameId carries.
+        CefRefPtr<CefFrame> frame = bit->second.browser->GetFrameByIdentifier(frameId);
+        if (frame)
         {
             frame->SendProcessMessage(PID_RENDERER, message);
         }

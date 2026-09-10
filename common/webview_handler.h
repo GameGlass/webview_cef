@@ -41,6 +41,8 @@ public CefDisplayHandler,
 public CefLifeSpanHandler,
 public CefFocusHandler,
 public CefLoadHandler,
+public CefRequestHandler,
+public CefPermissionHandler,
 public CefRenderHandler{
 public:
     //Paint callback (software off-screen rendering)
@@ -61,7 +63,15 @@ public:
     std::function<void(std::string, std::string, std::string, int browserId, std::string)> onJavaScriptChannelMessage;
     std::function<void(int browserId, std::string url)> onLoadStart;
     std::function<void(int browserId, std::string url)> onLoadEnd;
-    
+    // A load failed. |errorCode| is a cef_errorcode_t; |isMainFrame| separates a
+    // failure that blanks the page from a dead sub-resource, which the host will
+    // usually want to ignore.
+    std::function<void(int browserId, int errorCode, std::string errorText, std::string failedUrl, bool isMainFrame)> onLoadError;
+    // The render process for this browser died. The off-screen texture is now a
+    // dead surface, so the host has to re-create it or the view is frozen.
+    // |status| is a cef_termination_status_t.
+    std::function<void(int browserId, int status, int errorCode, std::string errorString)> onRenderProcessTerminated;
+
     explicit WebviewHandler();
     ~WebviewHandler();
     
@@ -76,6 +86,8 @@ public:
         return this;
     }
     virtual CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
+    virtual CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+    virtual CefRefPtr<CefPermissionHandler> GetPermissionHandler() override { return this; }
     virtual CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
 
 	bool OnProcessMessageReceived(
@@ -111,7 +123,10 @@ public:
                                int popup_id,
                                const CefString& target_url,
                                const CefString& target_frame_name,
-                               WindowOpenDisposition target_disposition,
+                               // Qualified: CefRequestHandler declares the same
+                               // typedef, so the unqualified name is ambiguous
+                               // now that both are base classes.
+                               CefLifeSpanHandler::WindowOpenDisposition target_disposition,
                                bool user_gesture,
                                const CefPopupFeatures& popupFeatures,
                                CefWindowInfo& windowInfo,
@@ -136,7 +151,20 @@ public:
     virtual void OnLoadStart(CefRefPtr<CefBrowser> browser,
                              CefRefPtr<CefFrame> frame,
                              CefLoadHandler::TransitionType transition_type) override;
-    
+
+    // CefRequestHandler methods:
+    virtual void OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser,
+                                           TerminationStatus status,
+                                           int error_code,
+                                           const CefString& error_string) override;
+
+    // CefPermissionHandler methods:
+    virtual bool OnRequestMediaAccessPermission(CefRefPtr<CefBrowser> browser,
+                                                CefRefPtr<CefFrame> frame,
+                                                const CefString& requesting_origin,
+                                                uint32_t requested_permissions,
+                                                CefRefPtr<CefMediaAccessCallback> callback) override;
+
     // CefRenderHandler methods:
     virtual void GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect) override;
     virtual void OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType type, const RectList& dirtyRects, const void* buffer, int width, int height) override;
@@ -168,6 +196,11 @@ public:
     void changeSize(int browserId, float a_dpi, int width, int height);
     void cursorClick(int browserId, int x, int y, bool up);
     void cursorMove(int browserId, int x, int y, bool dragging);
+    // Real touch input, kept off the mouse path so the page receives
+    // touchstart/touchmove/touchend instead of synthesised mouse events.
+    // type: 0=down, 1=up, 2=move, 3=cancel. id is the Flutter pointer id, so
+    // each finger becomes its own CEF touch point.
+    void sendTouchEvent(int browserId, int type, int id, int x, int y);
     void sendKeyEvent(CefKeyEvent& ev);
     void loadUrl(int browserId, std::string url);
     void goForward(int browserId);

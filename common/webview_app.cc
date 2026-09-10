@@ -201,6 +201,15 @@ void WebviewApp::OnWebKitInitialized()
     std::string extensionCode = R"(
 			var external = {};
 			var clientSdk = {};
+			// Declared as a top-level var, not as window.flutter_inappwebview:
+			// this script is compiled during V8 Genesis, before Blink installs the
+			// real window bindings, and reading the `window` global there hits a
+			// half-initialised accessor and trips a V8 CHECK
+			// (lookup.cc "state() == LookupIterator::DATA"), killing the renderer
+			// at every context creation. A top-level var lands on the global
+			// object all the same, so pages still see window.flutter_inappwebview.
+			// Note `window[...]` inside a function body is fine — that runs later.
+			var flutter_inappwebview = {};
 			(() => {
 				clientSdk.jsCmd = (functionName, arg1, arg2, arg3) => {
 					if (typeof arg1 === 'function') {
@@ -227,6 +236,11 @@ void WebviewApp::OnWebKitInitialized()
 					}
 				};
 
+                // Returns true if the request was handed to the native side.
+                // StartRequest throws when it cannot send (no current V8
+                // context or frame, duplicate request id); swallowing that here
+                // is what left callHandler's Promise pending forever, since its
+                // own try/catch never sees a throw this one has already caught.
                 external.JavaScriptChannel = (n,e,r) => {
                     var a; 
                     null == r ? a = '' : (a = '_' + new Date + (1e3 + Math.floor(8999 * Math.random())), window[a] = function (n, e) { 
@@ -241,8 +255,12 @@ void WebviewApp::OnWebKitInitialized()
                     try {
                         external.StartRequest(external.GetNextReqID(), n, a, JSON.stringify(e || {}), '') 
                     } catch (l) {
-                        console.log('messeage send')
+                        // Nothing will ever call it back now.
+                        if (a) { delete window[a]; }
+                        console.log('JavaScriptChannel send failed: ' + l);
+                        return false;
                     }
+                    return true;
                 }
 
                 external.EvaluateCallback = (nReqID, result) => {
@@ -258,6 +276,52 @@ void WebviewApp::OnWebKitInitialized()
 				  native function GetNextReqID();
 				  return GetNextReqID();
 				};
+
+                // flutter_inappwebview-compatible bridge.
+                //
+                // The embedded web app calls
+                // window.flutter_inappwebview.callHandler(name, ...args) and awaits
+                // the result. Presenting the same surface here means the web app
+                // needs no branch for which native webview it is running inside.
+                //
+                // Everything funnels through one JavaScriptChannel rather than one
+                // per handler: setJavaScriptChannels injects each channel name as a
+                // bare global, and the handler set is owned by the Dart side, so a
+                // single channel keeps the global namespace clean and lets Dart add
+                // handlers without re-injecting script.
+                //
+                // Registered via CefRegisterExtension, so it exists in every V8
+                // context before any page script runs — the web app can call it from
+                // its first inline script.
+                flutter_inappwebview.callHandler = function (handlerName) {
+                    var args = Array.prototype.slice.call(arguments, 1);
+                    return new Promise(function (resolve, reject) {
+                        try {
+                            var sent = external.JavaScriptChannel(
+                                'GgBridge',
+                                { handler: handlerName, args: args },
+                                function (result) {
+                                    // Dart replies {ok:true,value:...} or
+                                    // {ok:false,error:...}. Anything else resolves
+                                    // undefined rather than leaving the caller's
+                                    // await pending forever.
+                                    if (result && result.ok === false) {
+                                        reject(new Error(result.error || (handlerName + ' failed')));
+                                    } else {
+                                        resolve(result ? result.value : undefined);
+                                    }
+                                }
+                            );
+                            if (sent === false) {
+                                // The callback will never fire; settle now
+                                // rather than leave the caller awaiting.
+                                reject(new Error(handlerName + ': bridge send failed'));
+                            }
+                        } catch (e) {
+                            reject(e);
+                        }
+                    });
+                };
 			})();
 		 )";
 

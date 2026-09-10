@@ -54,6 +54,14 @@ class WebviewManager extends ValueNotifier<bool> {
     }
   }
 
+  /// Drops the bookkeeping [createWebView] set up for a controller that never
+  /// reached [onBrowserCreated], so one created and disposed without a
+  /// successful initialize does not leak an entry here.
+  void removePendingWebView(int browserIndex) {
+    _tempWebViews.remove(browserIndex);
+    _tempInjectUserScripts.remove(browserIndex);
+  }
+
   WebviewManager._internal() : super(false);
 
   Future<void> initialize({String? userAgent}) async {
@@ -143,6 +151,23 @@ class WebviewManager extends ValueNotifier<bool> {
             call.arguments['x'] as int,
             call.arguments['y'] as int,
             call.arguments['height'] as int);
+        return;
+      case 'onLoadError':
+        int browserId = call.arguments["browserId"] as int;
+        _webViews[browserId]?.listener?.onLoadError?.call(
+              call.arguments["errorCode"] as int,
+              call.arguments["errorText"] as String,
+              call.arguments["failedUrl"] as String,
+              call.arguments["isMainFrame"] as bool,
+            );
+        return;
+      case 'onRenderProcessTerminated':
+        int browserId = call.arguments["browserId"] as int;
+        _webViews[browserId]?.listener?.onRenderProcessTerminated?.call(
+              call.arguments["status"] as int,
+              call.arguments["errorCode"] as int,
+              call.arguments["errorString"] as String,
+            );
         return;
       case 'onLoadStart':
         int browserId = call.arguments["browserId"] as int;

@@ -17,12 +17,30 @@ typedef LoadStopCb = void Function(WebViewController controller, String url);
 typedef OnConsoleMessage = void Function(
     int level, String message, String source, int line);
 
+/// A load failed. [errorCode] is a `cef_errorcode_t`; [isMainFrame] separates a
+/// failure that blanks the view from a dead sub-resource, which callers usually
+/// want to ignore.
+///
+/// `ERR_ABORTED` is never reported: it is what every in-page navigation looks
+/// like natively, and treating it as a failure sends callers into a reload loop.
+typedef OnLoadErrorCb = void Function(
+    int errorCode, String errorText, String failedUrl, bool isMainFrame);
+
+/// The render process died. [status] is a `cef_termination_status_t`.
+///
+/// No further frames will be painted, so the texture is now a frozen last frame
+/// — reload to get a live surface back.
+typedef OnRenderProcessTerminatedCb = void Function(
+    int status, int errorCode, String errorString);
+
 class WebviewEventsListener {
   TitleChangeCb? onTitleChanged;
   UrlChangeCb? onUrlChanged;
   OnConsoleMessage? onConsoleMessage;
   LoadStartCb? onLoadStart;
   LoadStopCb? onLoadEnd;
+  OnLoadErrorCb? onLoadError;
+  OnRenderProcessTerminatedCb? onRenderProcessTerminated;
 
   WebviewEventsListener({
     this.onTitleChanged,
@@ -30,5 +48,7 @@ class WebviewEventsListener {
     this.onConsoleMessage,
     this.onLoadStart,
     this.onLoadEnd,
+    this.onLoadError,
+    this.onRenderProcessTerminated,
   });
 }
