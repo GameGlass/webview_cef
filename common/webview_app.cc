@@ -167,7 +167,28 @@ void WebviewApp::OnBeforeCommandLineProcessing(const CefString &process_type, Ce
     // selected by m_uMode above, like the other platforms.
 #endif
 #ifdef __linux__
-                                           
+    // Keep CEF on the same display backend as the window hosting it.
+    //
+    // GDK_BACKEND only affects GTK. Chromium picks its Ozone platform
+    // independently, from WAYLAND_DISPLAY/XDG_SESSION_TYPE — so an app running
+    // its own window on X11 (or XWayland) under a Wayland session still gets a
+    // Wayland-backed CEF. That mismatch crashes during startup inside Wayland
+    // Ozone's DRM render-node probe, with SIGTRAP out of base::ScopedFD's
+    // close():
+    //
+    //     ui::DrmRenderNodePathFinder::FindDrmRenderNodePath()
+    //     ui::CreateOzonePlatformWayland()
+    //     ui::OzonePlatform::PreSandboxStartup()
+    //     ...
+    //     cef_initialize
+    //
+    // Off-screen rendering needs no compositor connection of its own, so pin
+    // X11 — unless the embedder has already chosen a platform, in which case
+    // respect it. Applied for every process type, not just the browser, since
+    // the render/GPU children initialise Ozone too.
+    if (!command_line->HasSwitch("ozone-platform")) {
+        command_line->AppendSwitchWithValue("ozone-platform", "x11");
+    }
 #endif
 }
 
