@@ -20,11 +20,18 @@ dev_dependencies:
 flutter:
   plugin:
     platforms:
-      macos:
-        pluginClass: WebviewCefPlugin
-      windows:
-        pluginClass: WebviewCefPluginCApi
+      # Linux only, deliberately. This branch exists to back the GameGlass
+      # overlay's Linux webview; every other platform there is served by
+      # flutter_inappwebview (WebView2 on Windows, WKWebView on macOS).
+      #
+      # Flutter builds every platform implementation a plugin declares, so
+      # leaving the others here made `flutter build windows` download ~630MB of
+      # CEF, compile libcef_dll_wrapper, and bundle libcef.dll plus every .pak,
+      # .dat and locale into the release directory — several hundred MB of a
+      # Chromium the Windows app never initialises. The macos and elinux
+      # implementations are dropped for the same reason.
+      #
+      # Restore the upstream block if this branch is ever used for a platform
+      # other than Linux.
       linux:
-        pluginClass: WebviewCefPlugin
-      elinux:
         pluginClass: WebviewCefPlugin
