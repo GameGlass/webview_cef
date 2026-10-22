@@ -49,6 +49,7 @@ class WebViewController extends ValueNotifier<bool> {
   Completer<void> _creatingCompleter = Completer<void>();
   Future<void> get ready => _creatingCompleter.future;
   bool _initializeStarted = false;
+  bool _initializing = false;
   // [_browserId] is `late`; this says whether the platform side has handed one
   // back yet, because reading it before that throws.
   bool _browserCreated = false;
@@ -105,12 +106,18 @@ class WebViewController extends ValueNotifier<bool> {
     if (_isDisposed) {
       return Future<void>.value();
     }
+    // A second call while one is running would create a second browser, orphan
+    // the first and complete the same completer twice. It joins the first instead.
+    if (_initializing) {
+      return _creatingCompleter.future;
+    }
     // Only replace it on a re-initialize; the first one is created with the
     // controller so callers can chain off [ready] before this point.
     if (_creatingCompleter.isCompleted) {
       _creatingCompleter = Completer<void>();
     }
     _initializeStarted = true;
+    _initializing = true;
     try {
       await WebviewManager().ready;
       List args = await _pluginChannel.invokeMethod('create', url);
@@ -131,8 +138,12 @@ class WebViewController extends ValueNotifier<bool> {
             [_browserId, _javascriptChannels.keys.toList()]);
       }
       _creatingCompleter.complete();
-    } on PlatformException catch (e) {
-      _creatingCompleter.completeError(e);
+    } catch (e, stackTrace) {
+      // Any error, not only a PlatformException: one left uncaught would leave
+      // the completer pending, and dispose() waits on it
+      _creatingCompleter.completeError(e, stackTrace);
+    } finally {
+      _initializing = false;
     }
     return _creatingCompleter.future;
   }
