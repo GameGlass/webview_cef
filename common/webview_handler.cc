@@ -76,7 +76,8 @@ bool WebviewHandler::OnProcessMessageReceived(
 	    }
 
         onJavaScriptChannelMessage(
-            fun_name,param,stringpatch::to_string(js_callback_id), browser->GetIdentifier(), frame->GetIdentifier().ToString());
+            fun_name,param,stringpatch::to_string(js_callback_id), browser->GetIdentifier(), frame->GetIdentifier().ToString(),
+            frame->GetURL().ToString(), frame->IsMain());
     }
     else if(message_name == kEvaluateCallbackMessage){
         CefString callbackId = message->GetArgumentList()->GetString(0);

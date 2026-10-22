@@ -32,6 +32,10 @@ const int eventFlagIsKeyPad = 1 << 9;
 const int eventFlagIsLeft = 1 << 10;
 const int eventFlagIsRight = 1 << 11;
 
+// The channel window.flutter_inappwebview.callHandler sends through, see
+// OnWebKitInitialized in common/webview_app.cc
+const String _inAppWebViewBridgeChannel = 'GgBridge';
+
 class WebViewController extends ValueNotifier<bool> {
   WebViewController(this._pluginChannel, this._index, {Widget? loading})
       : super(false) {
@@ -66,10 +70,27 @@ class WebViewController extends ValueNotifier<bool> {
   WebviewEventsListener? get listener => _listener;
 
   get onJavascriptChannelMessage => (final String channelName,
-          final String message, final String callbackId, final String frameId) {
-        if (_javascriptChannels.containsKey(channelName)) {
-          _javascriptChannels[channelName]!.onMessageReceived(
-              JavascriptMessage(message, callbackId, frameId));
+          final String message,
+          final String callbackId,
+          final String frameId,
+          final String frameUrl,
+          final bool isMainFrame) {
+        if (channelName == _inAppWebViewBridgeChannel && !isMainFrame) {
+          // The bridge is in every V8 context, iframes included. Its handlers
+          // are written for the app's own page, so a third-party frame on it
+          // does not get to call them.
+          sendJavaScriptChannelCallBack(
+              true,
+              jsonEncode({
+                'ok': false,
+                'error': 'callHandler is only available in the main frame',
+              }),
+              callbackId,
+              frameId);
+        } else if (_javascriptChannels.containsKey(channelName)) {
+          _javascriptChannels[channelName]!.onMessageReceived(JavascriptMessage(
+              message, callbackId, frameId,
+              frameUrl: frameUrl, isMainFrame: isMainFrame));
         } else {
           debugPrint('Channel "$channelName" is not exists');
           // The page may be awaiting a reply. Answer with an error rather than

@@ -2,10 +2,14 @@
 
 #include <flutter_linux/flutter_linux.h>
 #include <gtk/gtk.h>
+#include <signal.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <unordered_map>
 #include <webview_plugin.h>
 #include "webview_cef_keyevent.h"
@@ -300,6 +304,35 @@ static void method_call_cb(FlMethodChannel *channel, FlMethodCall *method_call,
   webview_cef_plugin_handle_method_call(plugin, method_call);
 }
 
+// Removes the per-PID cache roots under |parent| whose process has exited, so
+// they do not pile up across runs. This process's own one goes as well: CEF has
+// not started yet, so anything in it is left over from an earlier process that
+// had the same PID, such as a stale singleton lock.
+static void remove_stale_cache_roots(const char *parent)
+{
+  std::error_code error;
+  std::filesystem::directory_iterator it(parent, error);
+  for (; !error && it != std::filesystem::directory_iterator();
+       it.increment(error))
+  {
+    const std::string name = it->path().filename().string();
+    char *end = nullptr;
+    errno = 0;
+    long pid = strtol(name.c_str(), &end, 10);
+    if (name.empty() || *end != '\0' || errno != 0 || pid <= 0)
+    {
+      continue;
+    }
+    // EPERM means the process exists but belongs to someone else
+    if (pid != getpid() && !(kill((pid_t)pid, 0) == -1 && errno == ESRCH))
+    {
+      continue;
+    }
+    std::error_code remove_error;
+    std::filesystem::remove_all(it->path(), remove_error);
+  }
+}
+
 void webview_cef_plugin_register_with_registrar(FlPluginRegistrar *registrar)
 {
   WebviewCefPlugin *plugin = WEBVIEW_CEF_PLUGIN(
@@ -325,12 +358,14 @@ void webview_cef_plugin_register_with_registrar(FlPluginRegistrar *registrar)
   // The cost is that nothing in here is reused across runs. That is already
   // true in practice: CefSettings.cache_path is left unset, so browser storage
   // is in-memory regardless, and this directory only holds the singleton lock
-  // and similar per-run bookkeeping.
+  // and similar per-run bookkeeping. Directories of processes that have exited
+  // are removed here, otherwise every run would leave one behind.
   const char *app_name = g_get_prgname();
+  g_autofree gchar *cache_parent = g_build_filename(
+      g_get_user_cache_dir(), app_name ? app_name : "webview_cef", "cef", nullptr);
+  remove_stale_cache_roots(cache_parent);
   g_autofree gchar *pid_dir = g_strdup_printf("%d", (int)getpid());
-  g_autofree gchar *cache_root = g_build_filename(
-      g_get_user_cache_dir(), app_name ? app_name : "webview_cef", "cef",
-      pid_dir, nullptr);
+  g_autofree gchar *cache_root = g_build_filename(cache_parent, pid_dir, nullptr);
   webview_cef::setRootCachePath(cache_root);
 
   g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();

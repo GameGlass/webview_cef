@@ -4,6 +4,7 @@
 
 #include "webview_app.h"
 
+#include <cstdlib>
 #include <string>
 
 #include "include/cef_browser.h"
@@ -186,7 +187,12 @@ void WebviewApp::OnBeforeCommandLineProcessing(const CefString &process_type, Ce
     // X11 — unless the embedder has already chosen a platform, in which case
     // respect it. Applied for every process type, not just the browser, since
     // the render/GPU children initialise Ozone too.
-    if (!command_line->HasSwitch("ozone-platform")) {
+    //
+    // Only when there is an X server to reach. A Wayland session without
+    // XWayland has no DISPLAY, and X11 Ozone would fail to start there, so CEF
+    // is left to pick Wayland as it did before.
+    const char *display = getenv("DISPLAY");
+    if (!command_line->HasSwitch("ozone-platform") && display && *display) {
         command_line->AppendSwitchWithValue("ozone-platform", "x11");
     }
 #endif
@@ -390,6 +396,32 @@ void WebviewApp::OnBrowserDestroyed(CefRefPtr<CefBrowser> browser)
 
 void WebviewApp::OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context)
 {
+    // flutter_inappwebview marks its bridge ready with _platformReady and the
+    // flutterInAppWebViewPlatformReady event, and web apps written for it wait
+    // on one or the other before calling callHandler. The bridge here works as
+    // soon as the context exists, so the flag is set now; the event waits for
+    // DOMContentLoaded so listeners added by the page's own scripts see it.
+    // Main frame only, as callHandler is only answered there.
+    //
+    // Run here rather than in the extension code, which is compiled before
+    // Blink installs window and document (see OnWebKitInitialized).
+    if (frame->IsMain()) {
+        CefRefPtr<CefV8Value> retval;
+        CefRefPtr<CefV8Exception> exception;
+        context->Eval(R"(
+            (function () {
+                flutter_inappwebview._platformReady = true;
+                function ready() {
+                    window.dispatchEvent(new Event('flutterInAppWebViewPlatformReady'));
+                }
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', ready, { once: true });
+                } else {
+                    ready();
+                }
+            })();
+        )", CefString(), 0, retval, exception);
+    }
 }
 
 void WebviewApp::OnContextReleased(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context)
